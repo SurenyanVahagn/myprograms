@@ -1,0 +1,402 @@
+#include <cassert>
+#include <iostream>
+
+template <class T> class WeakPtr;
+
+template <class T> struct Data {
+  T *data;
+  int shared_counter;
+  int weak_counter;
+
+  Data(T *data_) : data(data_), shared_counter(1), weak_counter(0) {}
+};
+
+template <class T> class SharedPtr {
+  friend WeakPtr<T>;
+
+private:
+  Data<T> *ptr{};
+
+  // Конструктор для lock
+  SharedPtr(Data<T> *ptr1) : ptr(ptr1) { ++(ptr->shared_counter); }
+
+  // Не использую этот конструктор, потому что не хочу давать shared-у доступ к weak-у
+  // SharedPtr(WeakPtr<T> wp) : ptr(wp.ptr) { ++(ptr->shared_counter); }
+
+public:
+  // Создает пустой SharedPtr
+  SharedPtr() {};
+
+  // Создает новый объект для конкретного указателя
+  SharedPtr(T *ptr_) : ptr(new Data<T>(ptr_)) {}
+
+  // Создает новый SharedPtr, который делит владение с other
+  SharedPtr(const SharedPtr &other) : ptr(other.ptr) {
+    if(ptr){
+      (ptr->shared_counter)++;
+    }
+  }
+
+  // Перезаписывает текущий умный указатель с other, при этом делит владение
+  SharedPtr &operator=(const SharedPtr &other) {
+    SharedPtr copied{other};
+    std::swap(copied.ptr, ptr);
+
+    return *this;
+  };
+
+  // Перезаписывает в текущий указатель указателем other(r-value)
+  SharedPtr(SharedPtr &&other) {
+    std::swap(ptr, other.ptr);
+  };
+
+  // Присваивает текущему указателю указатель other
+  SharedPtr &operator=(SharedPtr &&other) {
+    SharedPtr moved(std::move(other));
+    std::swap(ptr, moved.ptr);
+
+    return *this;
+  };
+
+  // Очищает память умного указателя
+  ~SharedPtr() {
+    if (!ptr) {
+      return;
+    }
+    --(ptr->shared_counter);
+    if (ptr->shared_counter == 0) {
+      delete ptr->data;
+      if (ptr->weak_counter == 0) {
+        delete ptr;
+      }
+    }
+  };
+
+  // Возвращает сырой указатель
+  T *get() const {
+    if(ptr)
+      return ptr->data; 
+    throw std::runtime_error("Error!!!");
+  };
+
+  //Результат разыменования указателя
+  T &operator*() const {
+    if(ptr)
+      return (*ptr->data);
+    throw std::runtime_error("Error!!!");
+  };
+  // Чтобы можно было писать ptr->field
+  T *operator->() const {
+    if(ptr)
+      return ptr->data;
+    throw std::runtime_error("Error!!!");
+  };
+
+  // Возвращает количество SharedPtr, с которыми делит память сохранённый
+  // указатель (включая самого себя)
+  long use_count() const {
+    if (ptr && ptr->shared_counter != 0)
+      return ptr->shared_counter;
+    return 0;
+  };
+
+  // Проверяет, не равен ли сохраненный указатель нулю: if (ptr) или if(!ptr)
+  operator bool() const {
+    return ptr != nullptr;
+  };
+
+ bool unique() const{
+   return (ptr && ptr->shared_counter == 1);
+ }; 
+
+  
+};
+
+template <class T>
+std::ostream& operator<<(std::ostream& out,const SharedPtr<T>& ins){
+
+  out << *ins ;
+  return out;
+}
+
+template <class T> class WeakPtr {
+private:
+  Data<T> *ptr{};
+
+public:
+  // Создает пустой WeakPtr
+  WeakPtr() {};
+
+  // Создает новый WeakPtr, который делит владение с other
+  WeakPtr(const WeakPtr<T> &shared) : ptr(shared.ptr) {
+    if(ptr != nullptr){
+      (ptr->weak_counter)++;
+    }
+  }
+
+  // Создает WeakPtr на SharedPtr (если other пуст, то текущий указатель тоже
+  // должен быть пустым)
+  WeakPtr(const SharedPtr<T> &other){
+    if(other.ptr){
+      ptr = other.ptr;
+      (ptr->weak_counter)++;
+    }
+  };
+
+  // Перезаписывает текущий WeakPtr с other
+  WeakPtr &operator=(const WeakPtr &other) {
+    WeakPtr copied{other};
+    std::swap(ptr, copied.ptr);
+
+    return *this;
+  };
+
+  // Перезаписывает текущий указатель указателем other(r-value)
+  WeakPtr(WeakPtr &&other) {
+    std::swap(ptr, other.ptr);
+  };
+
+  // Присваивает текущему указателю указатель  other
+  WeakPtr &operator=(WeakPtr &&other) {
+    WeakPtr moved{std::move(other)};
+    std::swap(ptr, moved.ptr);
+
+    return *this;
+  };
+
+  // Перезаписывает SharedPtr в WeakPtr (если other пуст, то текущий указатель
+  // тоже должен быть пустым)
+  WeakPtr &operator=(const SharedPtr<T> &other) {
+    WeakPtr wp; // чтобы грамотно сделать --weak_counter
+    std::swap(ptr, wp.ptr);
+    if(other.ptr){
+      ptr = other.ptr;
+      ++(ptr->weak_counter);
+    }
+    return *this;
+  };
+
+  // Уничтожает WeakPtr.
+  ~WeakPtr() {
+    if (!ptr) {
+      return;
+    }
+    --(ptr->weak_counter);
+    if ((ptr->shared_counter) == 0 && (ptr->weak_counter) == 0) {
+      delete ptr;
+    }
+  };
+
+  // Показывет количество SharedPtr, указывающих на этот объект.
+  long use_count() const {
+    if (ptr->shared_counter != 0 && ptr)
+      return (ptr->shared_counter);
+    return 0;
+  };
+
+  // Показывает, был ли удален управляемый объект .
+  bool expired() const { return use_count() == 0; };
+
+  // Создает новый SharedPtr, который разделяет права собственности на
+  // управляемый объект. Если управляемого объекта нет, то возвращаемый
+  // SharedPtr также пуст.
+  // Важно: доступ к ресурсу осуществляется только через lock
+  SharedPtr<T> lock() const {
+    if (ptr && ptr->shared_counter != 0)
+      return SharedPtr<T>{ptr};
+    return SharedPtr<T>{};
+  };
+};
+
+void test_Constructors_SharedPtr() {
+
+  SharedPtr<int> s1;
+  assert(!s1);
+
+  SharedPtr<int> s2{new int{10}};
+  assert(s2.use_count() == 1);
+
+  SharedPtr<int> s3{s2}; // copy
+
+  assert(s2.use_count() == s3.use_count());
+  assert(*s2.get() == *s3.get());
+
+  SharedPtr<int> s4{SharedPtr<int>{new int{10}}}; // move
+
+  assert(*s4.get() == 10);
+}
+
+void test_operator_assignment_l_value_SharedPtr() {
+
+  SharedPtr<int> s1{new int{10}};
+  SharedPtr<int> s2{new int{20}};
+  s1 = s2;
+
+  assert(*s1 == 20 && *s2 == 20);
+}
+
+void test_operator_assignment_r_value_SharedPtr() {
+
+  SharedPtr<int> s1{new int{10}};
+  SharedPtr<int> s2{s1};
+
+  s1 = SharedPtr<int>{new int{2}};
+  assert(*s1 == 2 && s1.use_count() == 1);
+
+  s1 = std::move(s2);
+  assert(*s1 == 10 && s1.use_count() == 1);
+  assert(s2.use_count() == 0);
+}
+
+void test_use_count_SharedPtr() {
+
+  SharedPtr<int> foo(new int{5});
+  SharedPtr<int> bar(foo);
+  assert(foo.use_count() == 2);
+  assert(*foo.get() == 5);
+}
+
+void test_use_count_empty_SharedPtr() {
+  SharedPtr<int> ptr{};
+  assert(ptr.use_count() == 0);
+}
+
+void test_dereference_SharedPtr() {
+
+  SharedPtr<int> foo(new int{5});
+  assert(foo.use_count() == 1);
+  assert(*foo == 5);
+
+  struct basic_struct {
+    int a;
+  };
+  SharedPtr<basic_struct> bar(new basic_struct{5});
+  assert(bar->a == 5);
+}
+
+void test_operator_bool() {
+
+  SharedPtr<int> p1(new int{100});
+  SharedPtr<int> p2;
+
+  assert(p1 == true);
+  assert(p2 == false);
+}
+
+void test_Constructors_WeakPtr() {
+  WeakPtr<int> w0{
+      SharedPtr<int>(new int{100}) // SharedPtr тут временный объект, который
+                                   // сразу после этого удаляется.
+  };
+
+  assert(w0.expired());
+
+  SharedPtr<int> p1{new int{42}};
+  WeakPtr<int> w1{p1};
+
+  assert(w1.use_count() == 1); // тут SharedPtr еще существует
+
+  WeakPtr<int> w2{w1};            // copy
+  WeakPtr<int> w3{std::move(w1)}; // move
+
+  assert(w1.use_count() == 0); // moved
+  assert(w2.use_count() == 1);
+  assert(w3.use_count() == 1);
+}
+
+void test_operator_assignment_l_value_WeakPtr() {
+
+  SharedPtr<int> s1{new int{10}};
+  WeakPtr<int> w1{s1};
+  WeakPtr<int> w2;
+  w2 = w1;
+
+  assert(w1.use_count() == 1);
+  assert(w2.use_count() == 1);
+}
+
+void test_operator_assignment_r_value_Weakptr() {
+
+  SharedPtr<int> s1{new int{10}};
+  WeakPtr<int> w1{s1};
+  WeakPtr<int> w2;
+  w2 = std::move(w1);
+
+  assert(w2.use_count() == 1);
+  assert(w1.expired());
+}
+
+void test_use_count_WeakPtr() {
+
+  SharedPtr<int> foo(new int{5});
+  SharedPtr<int> bar(foo);
+
+  WeakPtr<int> w1{foo};
+  WeakPtr<int> w2{bar};
+
+  assert(w1.use_count() == 2);
+  assert(w2.use_count() == 2);
+}
+
+void test_lock() {
+  WeakPtr<int> w1;
+  {
+    SharedPtr<int> s1{new int{42}};
+    w1 = s1;
+
+    assert(*w1.lock() == 42);
+
+    SharedPtr<int> s2 = w1.lock();
+    assert(*s2 == 42);
+    assert(w1.use_count() == 2);
+    assert(s1.use_count() == 2);
+    assert(s2.use_count() == 2);
+  } // s1 и s2 вышли из области видимости и отчистились. w1 еще существует
+  assert(w1.expired());
+
+  SharedPtr<int> s3 =
+      w1.lock(); // должен создать пустой SharedPtr, потому что expired
+  assert(!s3);
+}
+
+void test_lock_when_empty() {
+  WeakPtr<int> empty;
+  assert(!empty.lock());
+}
+
+void test_unique(){
+  SharedPtr<int> sh1(new int{50});
+  assert(sh1.unique() == true);
+
+  SharedPtr<int> sh2(new int{100});
+  SharedPtr<int> sh3{sh2};
+  assert(sh3.unique() == false);
+}
+
+void test_operator_ostream(){
+  SharedPtr<int> sh1{new int{42}};
+  std::cout << sh1;
+}
+
+int main() {
+
+  test_Constructors_SharedPtr();
+  test_operator_assignment_l_value_SharedPtr();
+  test_operator_assignment_r_value_SharedPtr();
+  test_use_count_SharedPtr();
+  test_use_count_empty_SharedPtr();
+
+  test_dereference_SharedPtr();
+  test_operator_bool();
+
+  test_Constructors_WeakPtr();
+  test_operator_assignment_l_value_WeakPtr();
+  test_operator_assignment_r_value_Weakptr();
+  test_use_count_WeakPtr();
+
+  test_lock();
+  test_lock_when_empty();
+
+  test_unique();
+  test_operator_ostream();
+}
